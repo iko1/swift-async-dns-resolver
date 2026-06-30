@@ -19,7 +19,7 @@ import XCTest
 
 final class AresErrorTests: XCTestCase {
     func test_initFromCode() {
-        let inputs: [Int32: AsyncDNSResolver.Error.Code] = [
+        let inputs: [ares_status_t: AsyncDNSResolver.Error.Code] = [
             ARES_EFORMERR: .badQuery,
             ARES_EBADQUERY: .badQuery,
             ARES_EBADNAME: .badQuery,
@@ -31,7 +31,7 @@ final class AresErrorTests: XCTestCase {
         ]
 
         for (code, expected) in inputs {
-            let error = AsyncDNSResolver.Error(cAresCode: code, "some error")
+            let error = AsyncDNSResolver.Error(cAresCode: Int32(code.rawValue), "some error")
             XCTAssertEqual(error.code, expected)
             XCTAssertEqual(
                 error.message,

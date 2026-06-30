@@ -273,7 +273,7 @@ extension Ares {
 
         init<Parser: AresQueryReplyParser>(parser: Parser, _ continuation: CheckedContinuation<Parser.Reply, Error>) {
             self._handler = { status, buffer, length in
-                guard status == ARES_SUCCESS || status == ARES_ENODATA else {
+                guard ares_status_t(status) == ARES_SUCCESS || ares_status_t(status) == ARES_ENODATA else {
                     return continuation.resume(throwing: AsyncDNSResolver.Error(cAresCode: status))
                 }
 
@@ -318,7 +318,7 @@ extension Ares {
 
             let parseStatus = ares_parse_a_reply(buffer, length, nil, addrttlsPointer, naddrttlsPointer)
 
-            switch parseStatus {
+            switch ares_status_t(parseStatus) {
             case ARES_SUCCESS:
                 let records = Array(UnsafeBufferPointer(start: addrttlsPointer, count: Int(naddrttlsPointer.pointee)))
                     .map { ARecord($0) }
@@ -347,7 +347,7 @@ extension Ares {
 
             let parseStatus = ares_parse_aaaa_reply(buffer, length, nil, addrttlsPointer, naddrttlsPointer)
 
-            switch parseStatus {
+            switch ares_status_t(parseStatus) {
             case ARES_SUCCESS:
                 let records = Array(UnsafeBufferPointer(start: addrttlsPointer, count: Int(naddrttlsPointer.pointee)))
                     .map { AAAARecord($0) }
@@ -371,7 +371,7 @@ extension Ares {
 
             let parseStatus = ares_parse_ns_reply(buffer, length, hostentPtrPtr)
 
-            switch parseStatus {
+            switch ares_status_t(parseStatus) {
             case ARES_SUCCESS:
                 guard let hostent = hostentPtrPtr.pointee?.pointee else {
                     return NSRecord(nameservers: [])
@@ -398,7 +398,7 @@ extension Ares {
 
             let parseStatus = ares_parse_a_reply(buffer, length, hostentPtrPtr, nil, nil)
 
-            switch parseStatus {
+            switch ares_status_t(parseStatus) {
             case ARES_SUCCESS:
                 guard let hostent = hostentPtrPtr.pointee?.pointee else {
                     return nil
@@ -421,7 +421,7 @@ extension Ares {
             defer { soaReplyPtrPtr.deallocate() }
 
             let parseStatus = ares_parse_soa_reply(buffer, length, soaReplyPtrPtr)
-            switch parseStatus {
+            switch ares_status_t(parseStatus) {
             case ARES_SUCCESS:
                 guard let soaReply = soaReplyPtrPtr.pointee?.pointee else {
                     return nil
@@ -464,7 +464,7 @@ extension Ares {
                 hostentPtrPtr
             )
 
-            switch parseStatus {
+            switch ares_status_t(parseStatus) {
             case ARES_SUCCESS:
                 guard let hostent = hostentPtrPtr.pointee?.pointee else {
                     return PTRRecord(names: [])
@@ -490,7 +490,7 @@ extension Ares {
             defer { mxsPointer.deallocate() }
 
             let parseStatus = ares_parse_mx_reply(buffer, length, mxsPointer)
-            switch parseStatus {
+            switch ares_status_t(parseStatus) {
             case ARES_SUCCESS:
                 var mxRecords = [MXRecord]()
                 var mxRecordOptional = mxsPointer.pointee?.pointee
@@ -523,7 +523,7 @@ extension Ares {
 
             let parseStatus = ares_parse_txt_reply(buffer, length, txtsPointer)
 
-            switch parseStatus {
+            switch ares_status_t(parseStatus) {
             case ARES_SUCCESS:
                 var txtRecords = [TXTRecord]()
                 var txtRecordOptional = txtsPointer.pointee?.pointee
@@ -555,7 +555,7 @@ extension Ares {
 
             let parseStatus = ares_parse_srv_reply(buffer, length, replyPointer)
 
-            switch parseStatus {
+            switch ares_status_t(parseStatus) {
             case ARES_SUCCESS:
                 var srvRecords = [SRVRecord]()
                 var srvRecordOptional = replyPointer.pointee?.pointee
@@ -590,7 +590,7 @@ extension Ares {
 
             let parseStatus = ares_parse_naptr_reply(buffer, length, naptrsPointer)
 
-            switch parseStatus {
+            switch ares_status_t(parseStatus) {
             case ARES_SUCCESS:
                 var naptrRecords = [NAPTRRecord]()
                 var naptrRecordOptional = naptrsPointer.pointee?.pointee
