@@ -39,6 +39,14 @@ let package = Package(
                 .headerSearchPath("./c-ares/src/lib"),
                 .headerSearchPath("./c-ares/src/lib/include"),
                 .define("HAVE_CONFIG_H", to: "1"),
+                // c-ares is built into the module as a static library, so its
+                // public symbols must not carry __declspec(dllimport/dllexport).
+                .define("CARES_STATICLIB", .when(platforms: [.windows])),
+            ],
+            linkerSettings: [
+                .linkedLibrary("ws2_32", .when(platforms: [.windows])),
+                .linkedLibrary("iphlpapi", .when(platforms: [.windows])),
+                .linkedLibrary("advapi32", .when(platforms: [.windows])),
             ]
         ),
 

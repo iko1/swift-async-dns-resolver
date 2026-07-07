@@ -14,6 +14,17 @@
 
 /* Generated from ares_config.h.cmake */
 
+#if defined(_WIN32)
+
+/* On Windows, defer to c-ares's own hand-crafted Windows configuration rather
+ * than the POSIX settings below. Use a path relative to this header so it
+ * resolves both when compiling the c-ares sources and when the Swift compiler
+ * builds the Clang module from the umbrella header (which does not have the
+ * c-ares/src/lib header search path). */
+#include "../c-ares/src/lib/config-win32.h"
+
+#else
+
 /* Define if building universal (internal helper macro) */
 #undef AC_APPLE_UNIVERSAL_BUILD
 
@@ -78,7 +89,7 @@
 #define HAVE_CONNECT 1
 
 /* Define to 1 if you have the connectx function. */
-#define HAVE_CONNECTX 1
+/* #undef HAVE_CONNECTX */
 
 /* define if the compiler supports basic C++11 syntax */
 /* #undef HAVE_CXX11 */
@@ -105,7 +116,7 @@
 /* #undef HAVE_PIPE2 */
 
 /* Define to 1 if you have the kqueue function. */
-#define HAVE_KQUEUE 1
+/* #undef HAVE_KQUEUE */
 
 /* Define to 1 if you have the epoll{_create,ctl,wait} functions. */
 /* #undef HAVE_EPOLL */
@@ -205,7 +216,7 @@
 #define HAVE_IOCTL_SIOCGIFADDR 1
 
 /* Define to 1 if you have the `resolve' library (-lresolve). */
-#define HAVE_LIBRESOLV 1
+/* #undef HAVE_LIBRESOLV */
 
 /* Define to 1 if you have iphlpapi.h */
 /* #undef HAVE_IPHLPAPI_H */
@@ -226,10 +237,10 @@
 #define HAVE_MEMORY_H 1
 
 /* Define to 1 if you have the AvailabilityMacros.h header file. */
-#define HAVE_AVAILABILITYMACROS_H 1
+/* #undef HAVE_AVAILABILITYMACROS_H */
 
 /* Define to 1 if you have the MSG_NOSIGNAL flag. */
-#define HAVE_MSG_NOSIGNAL 1
+/* #undef HAVE_MSG_NOSIGNAL */
 
 /* Define to 1 if you have the <netdb.h> header file. */
 #define HAVE_NETDB_H 1
@@ -346,7 +357,7 @@
 #define HAVE_SYS_RANDOM_H 1
 
 /* Define to 1 if you have the <sys/event.h> header file. */
-#define HAVE_SYS_EVENT_H 1
+/* #undef HAVE_SYS_EVENT_H */
 
 /* Define to 1 if you have the <sys/epoll.h> header file. */
 /* #undef HAVE_SYS_EPOLL_H */
@@ -409,7 +420,7 @@
 /* #undef HAVE___SYSTEM_PROPERTY_GET */
 
 /* Define if have arc4random_buf() */
-#define HAVE_ARC4RANDOM_BUF 1
+/* #undef HAVE_ARC4RANDOM_BUF */
 
 /* Define if have getifaddrs() */
 #define HAVE_GETIFADDRS 1
@@ -500,4 +511,6 @@
 
 /* Define to 1 if pthread_init() exists */
 /* #undef HAVE_PTHREAD_INIT */
+
+#endif /* _WIN32 */
 
