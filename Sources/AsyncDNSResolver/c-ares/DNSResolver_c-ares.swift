@@ -99,29 +99,29 @@ public final class CAresDNSResolver: DNSResolver, Sendable {
 }
 
 extension QueryType {
-    fileprivate var intValue: CInt {
-        /// See `arpa/nameser.h`.
+    /// The c-ares DNS record type for this query.
+    fileprivate var aresRecType: ares_dns_rec_type_t {
         switch self {
         case .A:
-            return 1
+            return ARES_REC_TYPE_A
         case .NS:
-            return 2
+            return ARES_REC_TYPE_NS
         case .CNAME:
-            return 5
+            return ARES_REC_TYPE_CNAME
         case .SOA:
-            return 6
+            return ARES_REC_TYPE_SOA
         case .PTR:
-            return 12
+            return ARES_REC_TYPE_PTR
         case .MX:
-            return 15
+            return ARES_REC_TYPE_MX
         case .TXT:
-            return 16
+            return ARES_REC_TYPE_TXT
         case .AAAA:
-            return 28
+            return ARES_REC_TYPE_AAAA
         case .SRV:
-            return 33
+            return ARES_REC_TYPE_SRV
         case .NAPTR:
-            return 35
+            return ARES_REC_TYPE_NAPTR
         }
     }
 }
@@ -132,17 +132,19 @@ extension QueryType {
 final class Ares: Sendable {
     typealias QueryCallback =
         @convention(c) (
-            UnsafeMutableRawPointer?, CInt, CInt, UnsafeMutablePointer<CUnsignedChar>?, CInt
+            UnsafeMutableRawPointer?, ares_status_t, size_t, OpaquePointer?
         ) -> Void
 
     private let channel: AresChannel
     private let queryProcessor: QueryProcessor
 
     init(options: AresOptions) throws {
-        self.channel = try AresChannel(options: options)
+        // `AresChannel` owns the socket registry and wires the c-ares `sock_state_cb`.
+        let channel = try AresChannel(options: options)
+        self.channel = channel
 
-        // Need to call `ares_process` or `ares_process_fd` for query callbacks to happen
-        self.queryProcessor = QueryProcessor(channel: self.channel)
+        // Need to call `ares_process_fd` for query callbacks to happen
+        self.queryProcessor = QueryProcessor(channel: channel)
         self.queryProcessor.start()
     }
 
@@ -154,7 +156,8 @@ final class Ares: Sendable {
         let channel = self.channel
         return try await withTaskCancellationHandler(
             operation: {
-                try await withCheckedThrowingContinuation { continuation in
+                try await withCheckedThrowingContinuation {
+                    (continuation: CheckedContinuation<ReplyParser.Reply, Error>) in
                     let handler = QueryReplyHandler(parser: replyParser, continuation)
 
                     // Wrap `handler` into a pointer so we can pass it to callback. The pointer will be deallocated in there later.
@@ -164,7 +167,7 @@ final class Ares: Sendable {
                     )
                     handlerPointer.initializeMemory(as: QueryReplyHandler.self, repeating: handler, count: 1)
 
-                    let queryCallback: QueryCallback = { arg, status, _, buf, len in
+                    let queryCallback: QueryCallback = { arg, status, _, dnsrec in
                         guard let handlerPointer = arg else {
                             preconditionFailure("'arg' is nil. This is a bug.")
                         }
@@ -176,11 +179,29 @@ final class Ares: Sendable {
                             pointer.deallocate()
                         }
 
-                        handler.handle(status: status, buffer: buf, length: len)
+                        handler.handle(status: status, dnsrec: dnsrec)
                     }
 
                     self.channel.withChannel { channel in
-                        ares_query(channel, name, DNSClass.IN.rawValue, type.intValue, queryCallback, handlerPointer)
+                        var qid: CUnsignedShort = 0
+                        let status = ares_query_dnsrec(
+                            channel,
+                            name,
+                            ARES_CLASS_IN,
+                            type.aresRecType,
+                            queryCallback,
+                            handlerPointer,
+                            &qid
+                        )
+                        // Unlike the deprecated `ares_query`, `ares_query_dnsrec` reports a
+                        // synchronous status. On failure the callback will not fire, so free
+                        // the handler here and fail the continuation to avoid a leak/hang.
+                        if status != ARES_SUCCESS {
+                            let pointer = handlerPointer.assumingMemoryBound(to: QueryReplyHandler.self)
+                            pointer.deinitialize(count: 1)
+                            pointer.deallocate()
+                            continuation.resume(throwing: AsyncDNSResolver.Error(cAresCode: CInt(status.rawValue)))
+                        }
                     }
                 }
             },
@@ -190,11 +211,6 @@ final class Ares: Sendable {
                 }
             }
         )
-    }
-
-    /// See `arpa/nameser.h`.
-    private enum DNSClass: CInt {
-        case IN = 1
     }
 }
 
@@ -219,31 +235,27 @@ extension Ares {
             self.locked_pollingTask?.cancel()
         }
 
-        init(channel: AresChannel, pollIntervalNanos: UInt64 = QueryProcessor.defaultPollInterval) {
+        init(
+            channel: AresChannel,
+            pollIntervalNanos: UInt64 = QueryProcessor.defaultPollInterval
+        ) {
             self.channel = channel
             self.pollIntervalNanos = pollIntervalNanos
         }
 
-        /// Asks c-ares for the set of socket descriptors we are waiting on for the `ares_channel`'s pending queries
-        /// then call `ares_process_fd` if any is ready for read and/or write.
-        /// c-ares returns up to `ARES_GETSOCK_MAXNUM` socket descriptors only. If more are in use (unlikely) they are not reported back.
+        /// Drives c-ares by calling `ares_process_fd` for each socket it is currently
+        /// waiting on. The set of sockets (and their read/write interest) is maintained
+        /// by the `sock_state_cb` in ``SocketRegistry`` rather than the deprecated
+        /// `ares_getsock`.
         func poll() {
-            var socks = [ares_socket_t](repeating: ares_socket_t(), count: Int(ARES_GETSOCK_MAXNUM))
+            let sockets = self.channel.socketRegistry.snapshot()
 
-            self.channel.withChannel { channel in
-                // Indicates what actions (i.e., read/write) to wait for on the different sockets
-                let bitmask = UInt32(ares_getsock(channel, &socks, ARES_GETSOCK_MAXNUM))
-
-                for (index, socket) in socks.enumerated() {
-                    let readableBit: UInt32 = 1 << UInt32(index)
-                    let readable = (bitmask & readableBit) != 0
-                    let writableBit = readableBit << UInt32(ARES_GETSOCK_MAXNUM)
-                    let writable = (bitmask & writableBit) != 0
-
-                    if readable || writable {
+            if !sockets.isEmpty {
+                self.channel.withChannel { channel in
+                    for entry in sockets {
                         // `ARES_SOCKET_BAD` instructs c-ares not to perform the action
-                        let readFD = readable ? socket : ARES_SOCKET_BAD
-                        let writeFD = writable ? socket : ARES_SOCKET_BAD
+                        let readFD = entry.readable ? entry.socket : ARES_SOCKET_BAD
+                        let writeFD = entry.writable ? entry.socket : ARES_SOCKET_BAD
                         ares_process_fd(channel, readFD, writeFD)
                     }
                 }
@@ -276,16 +288,16 @@ extension Ares {
 @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
 extension Ares {
     class QueryReplyHandler {
-        private let _handler: (CInt, UnsafeMutablePointer<CUnsignedChar>?, CInt) -> Void
+        private let _handler: (ares_status_t, OpaquePointer?) -> Void
 
         init<Parser: AresQueryReplyParser>(parser: Parser, _ continuation: CheckedContinuation<Parser.Reply, Error>) {
-            self._handler = { status, buffer, length in
-                guard ares_status_t(status) == ARES_SUCCESS || ares_status_t(status) == ARES_ENODATA else {
-                    return continuation.resume(throwing: AsyncDNSResolver.Error(cAresCode: status))
+            self._handler = { status, dnsrec in
+                guard status == ARES_SUCCESS || status == ARES_ENODATA else {
+                    return continuation.resume(throwing: AsyncDNSResolver.Error(cAresCode: CInt(status.rawValue)))
                 }
 
                 do {
-                    let reply = try parser.parse(buffer: buffer, length: length)
+                    let reply = try parser.parse(dnsrec)
                     continuation.resume(returning: reply)
                 } catch {
                     continuation.resume(throwing: error)
@@ -293,8 +305,8 @@ extension Ares {
             }
         }
 
-        func handle(status: CInt, buffer: UnsafeMutablePointer<CUnsignedChar>?, length: CInt) {
-            self._handler(status, buffer, length)
+        func handle(status: ares_status_t, dnsrec: OpaquePointer?) {
+            self._handler(status, dnsrec)
         }
     }
 }
@@ -304,38 +316,46 @@ extension Ares {
 protocol AresQueryReplyParser {
     associatedtype Reply: Sendable
 
-    func parse(buffer: UnsafeMutablePointer<CUnsignedChar>?, length: CInt) throws -> Reply
+    /// Parse a reply from the (already parsed) DNS record c-ares delivers to the
+    /// query callback. The `dnsrec` pointer (`const ares_dns_record_t *`) is owned
+    /// by c-ares and is only valid for the duration of the call.
+    func parse(_ dnsrec: OpaquePointer?) throws -> Reply
+}
+
+/// Returns the answer-section resource records of the given type from `dnsrec`.
+/// The returned `ares_dns_rr_t` pointers are owned by c-ares and only valid while
+/// `dnsrec` is (i.e. for the duration of the callback).
+private func answerRecords(_ dnsrec: OpaquePointer?, ofType type: ares_dns_rec_type_t) -> [OpaquePointer] {
+    guard let dnsrec = dnsrec else { return [] }
+    let count = ares_dns_record_rr_cnt(dnsrec, ARES_SECTION_ANSWER)
+    var records = [OpaquePointer]()
+    for index in 0..<count {
+        guard let rr = ares_dns_record_rr_get_const(dnsrec, ARES_SECTION_ANSWER, index) else { continue }
+        // The answer section can contain other record types (e.g. CNAMEs); the old
+        // `ares_parse_*_reply` filtered internally, so we must filter here.
+        if ares_dns_rr_get_type(rr) == type {
+            records.append(rr)
+        }
+    }
+    return records
+}
+
+private func string(_ rr: OpaquePointer, _ key: ares_dns_rr_key_t) -> String? {
+    ares_dns_rr_get_str(rr, key).map { String(cString: $0) }
 }
 
 @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
 extension Ares {
-    static let maxAddresses: Int = 32
-
     struct AQueryReplyParser: AresQueryReplyParser {
         static let instance = AQueryReplyParser()
 
-        func parse(buffer: UnsafeMutablePointer<CUnsignedChar>?, length: CInt) throws -> [ARecord] {
-            let addrttlsPointer = UnsafeMutablePointer<ares_addrttl>.allocate(capacity: Ares.maxAddresses)
-            defer { addrttlsPointer.deallocate() }
-            let naddrttlsPointer = UnsafeMutablePointer<CInt>.allocate(capacity: 1)
-            defer { naddrttlsPointer.deallocate() }
-
-            // Set a limit or else addrttl array won't be populated
-            naddrttlsPointer.pointee = CInt(Ares.maxAddresses)
-
-            let parseStatus = ares_parse_a_reply(buffer, length, nil, addrttlsPointer, naddrttlsPointer)
-
-            switch ares_status_t(parseStatus) {
-            case ARES_SUCCESS:
-                let records = Array(UnsafeBufferPointer(start: addrttlsPointer, count: Int(naddrttlsPointer.pointee)))
-                    .map { ARecord($0) }
-                return records
-
-            case ARES_ENODATA:
-                return []
-
-            default:
-                throw AsyncDNSResolver.Error(cAresCode: parseStatus, "failed to parse A query reply")
+        func parse(_ dnsrec: OpaquePointer?) throws -> [ARecord] {
+            answerRecords(dnsrec, ofType: ARES_REC_TYPE_A).compactMap { rr in
+                guard let addr = ares_dns_rr_get_addr(rr, ARES_RR_A_ADDR) else { return nil }
+                return ARecord(
+                    address: IPAddress.IPv4(addr.pointee),
+                    ttl: Int32(truncatingIfNeeded: ares_dns_rr_get_ttl(rr))
+                )
             }
         }
     }
@@ -343,28 +363,13 @@ extension Ares {
     struct AAAAQueryReplyParser: AresQueryReplyParser {
         static let instance = AAAAQueryReplyParser()
 
-        func parse(buffer: UnsafeMutablePointer<CUnsignedChar>?, length: CInt) throws -> [AAAARecord] {
-            let addrttlsPointer = UnsafeMutablePointer<ares_addr6ttl>.allocate(capacity: Ares.maxAddresses)
-            defer { addrttlsPointer.deallocate() }
-            let naddrttlsPointer = UnsafeMutablePointer<CInt>.allocate(capacity: 1)
-            defer { naddrttlsPointer.deallocate() }
-
-            // Set a limit or else addrttl array won't be populated
-            naddrttlsPointer.pointee = CInt(Ares.maxAddresses)
-
-            let parseStatus = ares_parse_aaaa_reply(buffer, length, nil, addrttlsPointer, naddrttlsPointer)
-
-            switch ares_status_t(parseStatus) {
-            case ARES_SUCCESS:
-                let records = Array(UnsafeBufferPointer(start: addrttlsPointer, count: Int(naddrttlsPointer.pointee)))
-                    .map { AAAARecord($0) }
-                return records
-
-            case ARES_ENODATA:
-                return []
-
-            default:
-                throw AsyncDNSResolver.Error(cAresCode: parseStatus, "failed to parse AAAA query reply")
+        func parse(_ dnsrec: OpaquePointer?) throws -> [AAAARecord] {
+            answerRecords(dnsrec, ofType: ARES_REC_TYPE_AAAA).compactMap { rr in
+                guard let addr = ares_dns_rr_get_addr6(rr, ARES_RR_AAAA_ADDR) else { return nil }
+                return AAAARecord(
+                    address: IPAddress.IPv6(addr.pointee),
+                    ttl: Int32(truncatingIfNeeded: ares_dns_rr_get_ttl(rr))
+                )
             }
         }
     }
@@ -372,151 +377,61 @@ extension Ares {
     struct NSQueryReplyParser: AresQueryReplyParser {
         static let instance = NSQueryReplyParser()
 
-        func parse(buffer: UnsafeMutablePointer<CUnsignedChar>?, length: CInt) throws -> NSRecord {
-            let hostentPtrPtr = UnsafeMutablePointer<UnsafeMutablePointer<hostent>?>.allocate(capacity: 1)
-            defer { hostentPtrPtr.deallocate() }
-
-            let parseStatus = ares_parse_ns_reply(buffer, length, hostentPtrPtr)
-
-            switch ares_status_t(parseStatus) {
-            case ARES_SUCCESS:
-                guard let hostent = hostentPtrPtr.pointee?.pointee else {
-                    return NSRecord(nameservers: [])
-                }
-
-                let nameServers = toStringArray(hostent.h_aliases)
-                return NSRecord(nameservers: nameServers ?? [])
-
-            case ARES_ENODATA:
-                return NSRecord(nameservers: [])
-
-            default:
-                throw AsyncDNSResolver.Error(cAresCode: parseStatus, "failed to parse NS query reply")
+        func parse(_ dnsrec: OpaquePointer?) throws -> NSRecord {
+            let nameservers = answerRecords(dnsrec, ofType: ARES_REC_TYPE_NS).compactMap {
+                string($0, ARES_RR_NS_NSDNAME)
             }
+            return NSRecord(nameservers: nameservers)
         }
     }
 
     struct CNAMEQueryReplyParser: AresQueryReplyParser {
         static let instance = CNAMEQueryReplyParser()
 
-        func parse(buffer: UnsafeMutablePointer<CUnsignedChar>?, length: CInt) throws -> String? {
-            let hostentPtrPtr = UnsafeMutablePointer<UnsafeMutablePointer<hostent>?>.allocate(capacity: 1)
-            defer { hostentPtrPtr.deallocate() }
-
-            let parseStatus = ares_parse_a_reply(buffer, length, hostentPtrPtr, nil, nil)
-
-            switch ares_status_t(parseStatus) {
-            case ARES_SUCCESS:
-                guard let hostent = hostentPtrPtr.pointee?.pointee else {
-                    return nil
-                }
-                return String(cString: hostent.h_name)
-
-            case ARES_ENODATA:
-                return nil
-            default:
-                throw AsyncDNSResolver.Error(cAresCode: parseStatus, "failed to parse CNAME query reply")
-            }
+        func parse(_ dnsrec: OpaquePointer?) throws -> String? {
+            answerRecords(dnsrec, ofType: ARES_REC_TYPE_CNAME).lazy.compactMap {
+                string($0, ARES_RR_CNAME_CNAME)
+            }.first
         }
     }
 
     struct SOAQueryReplyParser: AresQueryReplyParser {
         static let instance = SOAQueryReplyParser()
 
-        func parse(buffer: UnsafeMutablePointer<CUnsignedChar>?, length: CInt) throws -> SOARecord? {
-            let soaReplyPtrPtr = UnsafeMutablePointer<UnsafeMutablePointer<ares_soa_reply>?>.allocate(capacity: 1)
-            defer { soaReplyPtrPtr.deallocate() }
-
-            let parseStatus = ares_parse_soa_reply(buffer, length, soaReplyPtrPtr)
-            switch ares_status_t(parseStatus) {
-            case ARES_SUCCESS:
-                guard let soaReply = soaReplyPtrPtr.pointee?.pointee else {
-                    return nil
-                }
-
-                return SOARecord(
-                    mname: soaReply.nsname.map { String(cString: $0) },
-                    rname: soaReply.hostmaster.map { String(cString: $0) },
-                    serial: soaReply.serial,
-                    refresh: soaReply.refresh,
-                    retry: soaReply.retry,
-                    expire: soaReply.expire,
-                    ttl: soaReply.minttl
-                )
-
-            case ARES_ENODATA:
+        func parse(_ dnsrec: OpaquePointer?) throws -> SOARecord? {
+            guard let rr = answerRecords(dnsrec, ofType: ARES_REC_TYPE_SOA).first else {
                 return nil
-
-            default:
-                throw AsyncDNSResolver.Error(cAresCode: parseStatus, "failed to parse SOA query reply")
             }
+            return SOARecord(
+                mname: string(rr, ARES_RR_SOA_MNAME),
+                rname: string(rr, ARES_RR_SOA_RNAME),
+                serial: ares_dns_rr_get_u32(rr, ARES_RR_SOA_SERIAL),
+                refresh: ares_dns_rr_get_u32(rr, ARES_RR_SOA_REFRESH),
+                retry: ares_dns_rr_get_u32(rr, ARES_RR_SOA_RETRY),
+                expire: ares_dns_rr_get_u32(rr, ARES_RR_SOA_EXPIRE),
+                ttl: ares_dns_rr_get_u32(rr, ARES_RR_SOA_MINIMUM)
+            )
         }
     }
 
     struct PTRQueryReplyParser: AresQueryReplyParser {
         static let instance = PTRQueryReplyParser()
 
-        func parse(buffer: UnsafeMutablePointer<CUnsignedChar>?, length: CInt) throws -> PTRRecord {
-            let dummyAddrPointer = UnsafeMutablePointer<CChar>.allocate(capacity: 1)
-            defer { dummyAddrPointer.deallocate() }
-            let hostentPtrPtr = UnsafeMutablePointer<UnsafeMutablePointer<hostent>?>.allocate(capacity: 1)
-            defer { hostentPtrPtr.deallocate() }
-
-            let parseStatus = ares_parse_ptr_reply(
-                buffer,
-                length,
-                dummyAddrPointer,
-                INET_ADDRSTRLEN,
-                AF_INET,
-                hostentPtrPtr
-            )
-
-            switch ares_status_t(parseStatus) {
-            case ARES_SUCCESS:
-                guard let hostent = hostentPtrPtr.pointee?.pointee else {
-                    return PTRRecord(names: [])
-                }
-
-                let hostnames = toStringArray(hostent.h_aliases)
-                return PTRRecord(names: hostnames ?? [])
-
-            case ARES_ENODATA:
-                return PTRRecord(names: [])
-
-            default:
-                throw AsyncDNSResolver.Error(cAresCode: parseStatus, "failed to parse PTR query record")
+        func parse(_ dnsrec: OpaquePointer?) throws -> PTRRecord {
+            let names = answerRecords(dnsrec, ofType: ARES_REC_TYPE_PTR).compactMap {
+                string($0, ARES_RR_PTR_DNAME)
             }
+            return PTRRecord(names: names)
         }
     }
 
     struct MXQueryReplyParser: AresQueryReplyParser {
         static let instance = MXQueryReplyParser()
 
-        func parse(buffer: UnsafeMutablePointer<CUnsignedChar>?, length: CInt) throws -> [MXRecord] {
-            let mxsPointer = UnsafeMutablePointer<UnsafeMutablePointer<ares_mx_reply>?>.allocate(capacity: 1)
-            defer { mxsPointer.deallocate() }
-
-            let parseStatus = ares_parse_mx_reply(buffer, length, mxsPointer)
-            switch ares_status_t(parseStatus) {
-            case ARES_SUCCESS:
-                var mxRecords = [MXRecord]()
-                var mxRecordOptional = mxsPointer.pointee?.pointee
-                while let mxRecord = mxRecordOptional {
-                    mxRecords.append(
-                        MXRecord(
-                            host: String(cString: mxRecord.host),
-                            priority: mxRecord.priority
-                        )
-                    )
-                    mxRecordOptional = mxRecord.next?.pointee
-                }
-                return mxRecords
-
-            case ARES_ENODATA:
-                return []
-
-            default:
-                throw AsyncDNSResolver.Error(cAresCode: parseStatus, "failed to parse MX query record")
+        func parse(_ dnsrec: OpaquePointer?) throws -> [MXRecord] {
+            answerRecords(dnsrec, ofType: ARES_REC_TYPE_MX).compactMap { rr in
+                guard let host = string(rr, ARES_RR_MX_EXCHANGE) else { return nil }
+                return MXRecord(host: host, priority: ares_dns_rr_get_u16(rr, ARES_RR_MX_PREFERENCE))
             }
         }
     }
@@ -524,66 +439,34 @@ extension Ares {
     struct TXTQueryReplyParser: AresQueryReplyParser {
         static let instance = TXTQueryReplyParser()
 
-        func parse(buffer: UnsafeMutablePointer<CUnsignedChar>?, length: CInt) throws -> [TXTRecord] {
-            let txtsPointer = UnsafeMutablePointer<UnsafeMutablePointer<ares_txt_reply>?>.allocate(capacity: 1)
-            defer { txtsPointer.deallocate() }
-
-            let parseStatus = ares_parse_txt_reply(buffer, length, txtsPointer)
-
-            switch ares_status_t(parseStatus) {
-            case ARES_SUCCESS:
-                var txtRecords = [TXTRecord]()
-                var txtRecordOptional = txtsPointer.pointee?.pointee
-                while let txtRecord = txtRecordOptional {
-                    txtRecords.append(
-                        TXTRecord(
-                            txt: String(cString: txtRecord.txt)
-                        )
-                    )
-                    txtRecordOptional = txtRecord.next?.pointee
+        func parse(_ dnsrec: OpaquePointer?) throws -> [TXTRecord] {
+            var records = [TXTRecord]()
+            for rr in answerRecords(dnsrec, ofType: ARES_REC_TYPE_TXT) {
+                // TXT data is an array of binary strings; emit one record per segment.
+                let segments = ares_dns_rr_get_abin_cnt(rr, ARES_RR_TXT_DATA)
+                for index in 0..<segments {
+                    var length: size_t = 0
+                    guard let bytes = ares_dns_rr_get_abin(rr, ARES_RR_TXT_DATA, index, &length) else { continue }
+                    let txt = String(decoding: UnsafeBufferPointer(start: bytes, count: length), as: UTF8.self)
+                    records.append(TXTRecord(txt: txt))
                 }
-                return txtRecords
-
-            case ARES_ENODATA:
-                return []
-
-            default:
-                throw AsyncDNSResolver.Error(cAresCode: parseStatus, "failed to parse TXT query reply")
             }
+            return records
         }
     }
 
     struct SRVQueryReplyParser: AresQueryReplyParser {
         static let instance = SRVQueryReplyParser()
 
-        func parse(buffer: UnsafeMutablePointer<CUnsignedChar>?, length: CInt) throws -> [SRVRecord] {
-            let replyPointer = UnsafeMutablePointer<UnsafeMutablePointer<ares_srv_reply>?>.allocate(capacity: 1)
-            defer { replyPointer.deallocate() }
-
-            let parseStatus = ares_parse_srv_reply(buffer, length, replyPointer)
-
-            switch ares_status_t(parseStatus) {
-            case ARES_SUCCESS:
-                var srvRecords = [SRVRecord]()
-                var srvRecordOptional = replyPointer.pointee?.pointee
-                while let srvRecord = srvRecordOptional {
-                    srvRecords.append(
-                        SRVRecord(
-                            host: String(cString: srvRecord.host),
-                            port: srvRecord.port,
-                            weight: srvRecord.weight,
-                            priority: srvRecord.priority
-                        )
-                    )
-                    srvRecordOptional = srvRecord.next?.pointee
-                }
-                return srvRecords
-
-            case ARES_ENODATA:
-                return []
-
-            default:
-                throw AsyncDNSResolver.Error(cAresCode: parseStatus, "failed to parse SRV query reply")
+        func parse(_ dnsrec: OpaquePointer?) throws -> [SRVRecord] {
+            answerRecords(dnsrec, ofType: ARES_REC_TYPE_SRV).compactMap { rr in
+                guard let host = string(rr, ARES_RR_SRV_TARGET) else { return nil }
+                return SRVRecord(
+                    host: host,
+                    port: ares_dns_rr_get_u16(rr, ARES_RR_SRV_PORT),
+                    weight: ares_dns_rr_get_u16(rr, ARES_RR_SRV_WEIGHT),
+                    priority: ares_dns_rr_get_u16(rr, ARES_RR_SRV_PRIORITY)
+                )
             }
         }
     }
@@ -591,56 +474,22 @@ extension Ares {
     struct NAPTRQueryReplyParser: AresQueryReplyParser {
         static let instance = NAPTRQueryReplyParser()
 
-        func parse(buffer: UnsafeMutablePointer<CUnsignedChar>?, length: CInt) throws -> [NAPTRRecord] {
-            let naptrsPointer = UnsafeMutablePointer<UnsafeMutablePointer<ares_naptr_reply>?>.allocate(capacity: 1)
-            defer { naptrsPointer.deallocate() }
-
-            let parseStatus = ares_parse_naptr_reply(buffer, length, naptrsPointer)
-
-            switch ares_status_t(parseStatus) {
-            case ARES_SUCCESS:
-                var naptrRecords = [NAPTRRecord]()
-                var naptrRecordOptional = naptrsPointer.pointee?.pointee
-                while let naptrRecord = naptrRecordOptional {
-                    naptrRecords.append(
-                        NAPTRRecord(
-                            flags: String(cString: naptrRecord.flags),
-                            service: String(cString: naptrRecord.service),
-                            regExp: String(cString: naptrRecord.regexp),
-                            replacement: String(cString: naptrRecord.replacement),
-                            order: naptrRecord.order,
-                            preference: naptrRecord.preference
-                        )
-                    )
-                    naptrRecordOptional = naptrRecord.next?.pointee
-                }
-                return naptrRecords
-
-            case ARES_ENODATA:
-                return []
-
-            default:
-                throw AsyncDNSResolver.Error(cAresCode: parseStatus, "failed to parse NAPTR query reply")
+        func parse(_ dnsrec: OpaquePointer?) throws -> [NAPTRRecord] {
+            answerRecords(dnsrec, ofType: ARES_REC_TYPE_NAPTR).map { rr in
+                NAPTRRecord(
+                    flags: string(rr, ARES_RR_NAPTR_FLAGS),
+                    service: string(rr, ARES_RR_NAPTR_SERVICES),
+                    regExp: string(rr, ARES_RR_NAPTR_REGEXP),
+                    replacement: string(rr, ARES_RR_NAPTR_REPLACEMENT) ?? "",
+                    order: ares_dns_rr_get_u16(rr, ARES_RR_NAPTR_ORDER),
+                    preference: ares_dns_rr_get_u16(rr, ARES_RR_NAPTR_PREFERENCE)
+                )
             }
         }
     }
 }
 
 // MARK: - helpers
-
-private func toStringArray(_ arrayPointer: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> [String]? {
-    guard let arrayPointer = arrayPointer else {
-        return nil
-    }
-
-    var result = [String]()
-    var stringPointer = arrayPointer
-    while let ptr = stringPointer.pointee {
-        result.append(String(cString: ptr))
-        stringPointer = stringPointer.advanced(by: 1)
-    }
-    return result
-}
 
 extension IPAddress.IPv4 {
     init(_ address: in_addr) {
@@ -655,20 +504,6 @@ extension IPAddress.IPv6 {
         var address = address
         let addressString = sys_inet_ntop(family: AF_INET6, bytes: &address, length: Int(INET6_ADDRSTRLEN)) ?? ""
         self = IPAddress.IPv6(address: addressString)
-    }
-}
-
-extension ARecord {
-    init(_ addrttl: ares_addrttl) {
-        self.address = IPAddress.IPv4(addrttl.ipaddr)
-        self.ttl = addrttl.ttl
-    }
-}
-
-extension AAAARecord {
-    init(_ addrttl: ares_addr6ttl) {
-        self.address = IPAddress.IPv6(addrttl.ip6addr)
-        self.ttl = addrttl.ttl
     }
 }
 
