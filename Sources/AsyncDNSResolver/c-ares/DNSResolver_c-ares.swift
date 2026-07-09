@@ -295,11 +295,16 @@ extension Ares {
     /// and always resumes outside its lock so it can never invert with the channel or
     /// task-status locks.
     final class QueryReplyHandler: @unchecked Sendable {
+        /// Whichever of a c-ares reply or a task cancellation arrives first.
+        enum Outcome {
+            case reply(status: CInt, buffer: UnsafeMutablePointer<CUnsignedChar>?, length: CInt)
+            case cancelled
+        }
+
         private let lock = NSLock()
         private var hasResumed = false
         private var cancelledBeforeReady = false
-        private var resumeWithReply: ((CInt, UnsafeMutablePointer<CUnsignedChar>?, CInt) -> Void)?
-        private var resumeWithCancellation: (() -> Void)?
+        private var resume: ((Outcome) -> Void)?
 
         #if DEBUG
         /// Test-only live-instance counter, so tests can assert that a cancelled query's
@@ -329,18 +334,22 @@ extension Ares {
                 continuation.resume(throwing: CancellationError())
                 return false
             }
-            self.resumeWithReply = { status, buffer, length in
-                guard status == ARES_SUCCESS || status == ARES_ENODATA else {
-                    return continuation.resume(throwing: AsyncDNSResolver.Error(cAresCode: status))
-                }
-                do {
-                    let reply = try parser.parse(buffer: buffer, length: length)
-                    continuation.resume(returning: reply)
-                } catch {
-                    continuation.resume(throwing: error)
+            self.resume = { outcome in
+                switch outcome {
+                case .cancelled:
+                    continuation.resume(throwing: CancellationError())
+                case .reply(let status, let buffer, let length):
+                    guard status == ARES_SUCCESS || status == ARES_ENODATA else {
+                        return continuation.resume(throwing: AsyncDNSResolver.Error(cAresCode: status))
+                    }
+                    do {
+                        let reply = try parser.parse(buffer: buffer, length: length)
+                        continuation.resume(returning: reply)
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
                 }
             }
-            self.resumeWithCancellation = { continuation.resume(throwing: CancellationError()) }
             self.lock.unlock()
             return true
         }
@@ -353,10 +362,10 @@ extension Ares {
                 return
             }
             self.hasResumed = true
-            let resume = self.resumeWithReply
+            let resume = self.resume
             self.lock.unlock()
             // Resume outside the lock: never hold `lock` across `continuation.resume`.
-            resume?(status, buffer, length)
+            resume?(.reply(status: status, buffer: buffer, length: length))
         }
 
         /// Invoked from the task cancellation handler. Resumes this query's continuation
@@ -367,7 +376,7 @@ extension Ares {
                 self.lock.unlock()
                 return
             }
-            guard let resume = self.resumeWithCancellation else {
+            guard let resume = self.resume else {
                 // Cancelled before the continuation was attached; initialize resumes.
                 self.cancelledBeforeReady = true
                 self.lock.unlock()
@@ -375,7 +384,7 @@ extension Ares {
             }
             self.hasResumed = true
             self.lock.unlock()
-            resume()
+            resume(.cancelled)
         }
     }
 }
