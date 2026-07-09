@@ -195,8 +195,8 @@ final class Ares: Sendable {
             onCancel: {
                 // Cancel only THIS query's continuation. We deliberately do NOT call
                 // `ares_cancel`: it cancels every in-flight query on the shared channel
-                // (so parallel queries would be cancelled too), and — invoked from the
-                // task-cancellation context — it races with the poll loop resuming a
+                // (so parallel queries would be cancelled too), and, invoked from the
+                // task-cancellation context, it races with the poll loop resuming a
                 // continuation under the channel lock, deadlocking the resolver. The
                 // c-ares request is left to finish on its own (bounded by its timeout);
                 // its callback then finds the continuation already resumed and only
@@ -302,9 +302,12 @@ extension Ares {
         }
 
         private let lock = NSLock()
-        private var hasResumed = false
-        private var cancelledBeforeReady = false
+        // Set by `initialize`; read and cleared to `nil` by the first of `handle`/`cancel`.
+        // A `nil` value means the continuation has already been resumed, which enforces
+        // resume-once without a separate flag.
         private var resume: ((Outcome) -> Void)?
+        // Set only when cancellation arrives before `initialize`; consumed there.
+        private var cancelledBeforeReady = false
 
         #if DEBUG
         /// Test-only live-instance counter, so tests can assert that a cancelled query's
@@ -329,7 +332,6 @@ extension Ares {
         ) -> Bool {
             self.lock.lock()
             if self.cancelledBeforeReady {
-                self.hasResumed = true
                 self.lock.unlock()
                 continuation.resume(throwing: CancellationError())
                 return false
@@ -357,14 +359,11 @@ extension Ares {
         /// Invoked from the c-ares callback (on the poll loop) when the query completes.
         func handle(status: CInt, buffer: UnsafeMutablePointer<CUnsignedChar>?, length: CInt) {
             self.lock.lock()
-            if self.hasResumed {
-                self.lock.unlock()
-                return
-            }
-            self.hasResumed = true
             let resume = self.resume
+            self.resume = nil
             self.lock.unlock()
             // Resume outside the lock: never hold `lock` across `continuation.resume`.
+            // A `nil` resume means it has already run: nothing to do.
             resume?(.reply(status: status, buffer: buffer, length: length))
         }
 
@@ -372,19 +371,15 @@ extension Ares {
         /// with `CancellationError` exactly once, without touching c-ares.
         func cancel() {
             self.lock.lock()
-            if self.hasResumed {
-                self.lock.unlock()
-                return
-            }
-            guard let resume = self.resume else {
-                // Cancelled before the continuation was attached; initialize resumes.
+            let resume = self.resume
+            self.resume = nil
+            if resume == nil {
+                // `initialize` hasn't run yet (it resumes with cancellation when it does),
+                // or the continuation was already resumed (this flag is then never read).
                 self.cancelledBeforeReady = true
-                self.lock.unlock()
-                return
             }
-            self.hasResumed = true
             self.lock.unlock()
-            resume(.cancelled)
+            resume?(.cancelled)
         }
     }
 }
