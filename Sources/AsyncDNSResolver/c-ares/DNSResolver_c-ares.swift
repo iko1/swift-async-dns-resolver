@@ -159,7 +159,11 @@ final class Ares: Sendable {
             operation: {
                 try await withCheckedThrowingContinuation {
                     (continuation: CheckedContinuation<ReplyParser.Reply, Error>) in
-                    handler.setContinuation(continuation, parser: replyParser)
+                    // If the task was already cancelled, `setContinuation` resumes with a
+                    // `CancellationError` and returns `false`, so we must not issue the request.
+                    guard handler.setContinuation(continuation, parser: replyParser) else {
+                        return
+                    }
 
                     // Wrap `handler` into a pointer so we can pass it to callback. The pointer will be deallocated in there later.
                     let handlerPointer = UnsafeMutableRawPointer.allocate(
@@ -312,18 +316,18 @@ extension Ares {
         deinit { Self.liveInstances.decrement() }
         #endif
 
-        /// Attach the continuation once `withCheckedThrowingContinuation` provides it.
-        /// If the task was already cancelled before this point, resume immediately.
+        /// Attaches the continuation. Returns `true` if the caller should start the request,
+        /// or `false` if the task was already cancelled (the continuation is resumed here).
         func setContinuation<Parser: AresQueryReplyParser>(
             _ continuation: CheckedContinuation<Parser.Reply, Error>,
             parser: Parser
-        ) {
+        ) -> Bool {
             self.lock.lock()
             if self.cancelledBeforeReady {
                 self.hasResumed = true
                 self.lock.unlock()
                 continuation.resume(throwing: CancellationError())
-                return
+                return false
             }
             self.resumeWithReply = { status, buffer, length in
                 guard status == ARES_SUCCESS || status == ARES_ENODATA else {
@@ -338,12 +342,13 @@ extension Ares {
             }
             self.resumeWithCancellation = { continuation.resume(throwing: CancellationError()) }
             self.lock.unlock()
+            return true
         }
 
         /// Invoked from the c-ares callback (on the poll loop) when the query completes.
         func handle(status: CInt, buffer: UnsafeMutablePointer<CUnsignedChar>?, length: CInt) {
             self.lock.lock()
-            guard !self.hasResumed else {
+            if self.hasResumed {
                 self.lock.unlock()
                 return
             }
@@ -358,7 +363,7 @@ extension Ares {
         /// with `CancellationError` exactly once, without touching c-ares.
         func cancel() {
             self.lock.lock()
-            guard !self.hasResumed else {
+            if self.hasResumed {
                 self.lock.unlock()
                 return
             }
