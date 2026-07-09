@@ -159,9 +159,9 @@ final class Ares: Sendable {
             operation: {
                 try await withCheckedThrowingContinuation {
                     (continuation: CheckedContinuation<ReplyParser.Reply, Error>) in
-                    // If the task was already cancelled, `setContinuation` resumes with a
+                    // If the task was already cancelled, `initialize` resumes with a
                     // `CancellationError` and returns `false`, so we must not issue the request.
-                    guard handler.setContinuation(continuation, parser: replyParser) else {
+                    guard handler.initialize(continuation, parser: replyParser) else {
                         return
                     }
 
@@ -318,7 +318,7 @@ extension Ares {
 
         /// Attaches the continuation. Returns `true` if the caller should start the request,
         /// or `false` if the task was already cancelled (the continuation is resumed here).
-        func setContinuation<Parser: AresQueryReplyParser>(
+        func initialize<Parser: AresQueryReplyParser>(
             _ continuation: CheckedContinuation<Parser.Reply, Error>,
             parser: Parser
         ) -> Bool {
@@ -368,7 +368,7 @@ extension Ares {
                 return
             }
             guard let resume = self.resumeWithCancellation else {
-                // Cancelled before the continuation was attached; setContinuation resumes.
+                // Cancelled before the continuation was attached; initialize resumes.
                 self.cancelledBeforeReady = true
                 self.lock.unlock()
                 return
