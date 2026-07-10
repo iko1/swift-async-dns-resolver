@@ -315,9 +315,21 @@ extension Ares {
         final class LiveCounter: @unchecked Sendable {
             private let lock = NSLock()
             private var count = 0
-            func increment() { self.lock.lock(); self.count += 1; self.lock.unlock() }
-            func decrement() { self.lock.lock(); self.count -= 1; self.lock.unlock() }
-            var current: Int { self.lock.lock(); defer { self.lock.unlock() }; return self.count }
+            func increment() {
+                self.lock.lock()
+                self.count += 1
+                self.lock.unlock()
+            }
+            func decrement() {
+                self.lock.lock()
+                self.count -= 1
+                self.lock.unlock()
+            }
+            var current: Int {
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                return self.count
+            }
         }
         static let liveInstances = LiveCounter()
         init() { Self.liveInstances.increment() }
@@ -359,8 +371,7 @@ extension Ares {
         /// Invoked from the c-ares callback (on the poll loop) when the query completes.
         func handle(status: CInt, buffer: UnsafeMutablePointer<CUnsignedChar>?, length: CInt) {
             self.lock.lock()
-            let resume = self.resume
-            self.resume = nil
+            let resume = self.resume.take()
             self.lock.unlock()
             // Resume outside the lock: never hold `lock` across `continuation.resume`.
             // A `nil` resume means it has already run: nothing to do.
@@ -371,8 +382,7 @@ extension Ares {
         /// with `CancellationError` exactly once, without touching c-ares.
         func cancel() {
             self.lock.lock()
-            let resume = self.resume
-            self.resume = nil
+            let resume = self.resume.take()
             if resume == nil {
                 // `initialize` hasn't run yet (it resumes with cancellation when it does),
                 // or the continuation was already resumed (this flag is then never read).

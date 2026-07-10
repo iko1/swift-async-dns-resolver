@@ -34,8 +34,8 @@ final class CAresCancellationTests: XCTestCase {
 
     /// Race-style: repeatedly start an in-flight query and cancel it from another task
     /// while the resolver is polling. Each cancel must settle promptly with
-    /// `CancellationError` — a cancel that re-entered the locked resolver state / inverted
-    /// with the poll loop would hang and trip the watchdog.
+    /// `CancellationError`. A cancel that re-entered the locked resolver state / inverted
+    /// with the poll loop would deadlock and trip the watchdog.
     func test_cancelInFlightQuery_isRaceSafeAndSettlesWithoutDeadlock() async throws {
         let resolver = try self.makeResolver()
         for iteration in 0..<25 {
@@ -58,7 +58,10 @@ final class CAresCancellationTests: XCTestCase {
                 XCTFail("iteration \(iteration): cancelled query unexpectedly succeeded")
                 return
             case .some(.failure(let error)):
-                XCTAssertTrue(error is CancellationError, "iteration \(iteration): expected CancellationError, got \(error)")
+                XCTAssertTrue(
+                    error is CancellationError,
+                    "iteration \(iteration): expected CancellationError, got \(error)"
+                )
             }
         }
     }
@@ -108,8 +111,16 @@ final class CAresCancellationTests: XCTestCase {
     private final class AtomicFlag: @unchecked Sendable {
         private let lock = NSLock()
         private var flag = false
-        func set() { self.lock.lock(); self.flag = true; self.lock.unlock() }
-        var value: Bool { self.lock.lock(); defer { self.lock.unlock() }; return self.flag }
+        func set() {
+            self.lock.lock()
+            self.flag = true
+            self.lock.unlock()
+        }
+        var value: Bool {
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            return self.flag
+        }
     }
 
     #if DEBUG
@@ -133,7 +144,8 @@ final class CAresCancellationTests: XCTestCase {
         let query = Task { try await resolver.queryA(name: "example.com") }
         try await Task.sleep(nanoseconds: 100_000_000)
         XCTAssertGreaterThan(
-            Ares.QueryReplyHandler.liveInstances.current, baseline,
+            Ares.QueryReplyHandler.liveInstances.current,
+            baseline,
             "handler should be alive while the query is in flight"
         )
         query.cancel()
