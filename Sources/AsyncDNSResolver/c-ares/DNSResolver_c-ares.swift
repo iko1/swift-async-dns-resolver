@@ -153,12 +153,19 @@ final class Ares: Sendable {
         name: String,
         replyParser: ReplyParser
     ) async throws -> ReplyParser.Reply {
-        let channel = self.channel
+        // Created up front so both the query operation and the cancellation handler
+        // share the same per-query handler. `QueryReplyHandler` guarantees the
+        // continuation is resumed exactly once.
+        let handler = QueryReplyHandler()
         return try await withTaskCancellationHandler(
             operation: {
                 try await withCheckedThrowingContinuation {
                     (continuation: CheckedContinuation<ReplyParser.Reply, Error>) in
-                    let handler = QueryReplyHandler(parser: replyParser, continuation)
+                    // If the task was already cancelled, `initialize` resumes with a
+                    // `CancellationError` and returns `false`, so we must not issue the request.
+                    guard handler.initialize(continuation, parser: replyParser) else {
+                        return
+                    }
 
                     // Wrap `handler` into a pointer so we can pass it to callback. The pointer will be deallocated in there later.
                     let handlerPointer = UnsafeMutableRawPointer.allocate(
@@ -207,9 +214,15 @@ final class Ares: Sendable {
                 }
             },
             onCancel: {
-                channel.withChannel { channel in
-                    ares_cancel(channel)
-                }
+                // Cancel only THIS query's continuation. We deliberately do NOT call
+                // `ares_cancel`: it cancels every in-flight query on the shared channel
+                // (so parallel queries would be cancelled too), and, invoked from the
+                // task-cancellation context, it races with the poll loop resuming a
+                // continuation under the channel lock, deadlocking the resolver. The
+                // c-ares request is left to finish on its own (bounded by its timeout);
+                // its callback then finds the continuation already resumed and only
+                // cleans up.
+                handler.cancel()
             }
         )
     }
@@ -288,26 +301,109 @@ extension Ares {
 
 @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
 extension Ares {
-    class QueryReplyHandler {
-        private let _handler: (ares_status_t, OpaquePointer?) -> Void
-
-        init<Parser: AresQueryReplyParser>(parser: Parser, _ continuation: CheckedContinuation<Parser.Reply, Error>) {
-            self._handler = { status, dnsrec in
-                guard status == ARES_SUCCESS || status == ARES_ENODATA else {
-                    return continuation.resume(throwing: AsyncDNSResolver.Error(cAresCode: CInt(status.rawValue)))
-                }
-
-                do {
-                    let reply = try parser.parse(dnsrec)
-                    continuation.resume(returning: reply)
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
+    /// Per-query bridge between the c-ares callback / task cancellation and the
+    /// `CheckedContinuation`. Guarantees the continuation is resumed exactly once,
+    /// whichever of the two arrives first (a reply/timeout callback, or cancellation),
+    /// and always resumes outside its lock so it can never invert with the channel or
+    /// task-status locks.
+    final class QueryReplyHandler: @unchecked Sendable {
+        /// Whichever of a c-ares reply or a task cancellation arrives first. The `dnsrec`
+        /// pointer is owned by c-ares and only valid for the duration of the callback, so
+        /// the reply is parsed synchronously while the outcome is delivered.
+        enum Outcome {
+            case reply(status: ares_status_t, dnsrec: OpaquePointer?)
+            case cancelled
         }
 
+        private let lock = NSLock()
+        // Set by `initialize`; read and cleared to `nil` by the first of `handle`/`cancel`.
+        // A `nil` value means the continuation has already been resumed, which enforces
+        // resume-once without a separate flag.
+        private var resume: ((Outcome) -> Void)?
+        // Set only when cancellation arrives before `initialize`; consumed there.
+        private var cancelledBeforeReady = false
+
+        #if DEBUG
+        /// Test-only live-instance counter, so tests can assert that a cancelled query's
+        /// deferred c-ares work is eventually released and does not leak.
+        final class LiveCounter: @unchecked Sendable {
+            private let lock = NSLock()
+            private var count = 0
+            func increment() {
+                self.lock.lock()
+                self.count += 1
+                self.lock.unlock()
+            }
+            func decrement() {
+                self.lock.lock()
+                self.count -= 1
+                self.lock.unlock()
+            }
+            var current: Int {
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                return self.count
+            }
+        }
+        static let liveInstances = LiveCounter()
+        init() { Self.liveInstances.increment() }
+        deinit { Self.liveInstances.decrement() }
+        #endif
+
+        /// Attaches the continuation. Returns `true` if the caller should start the request,
+        /// or `false` if the task was already cancelled (the continuation is resumed here).
+        func initialize<Parser: AresQueryReplyParser>(
+            _ continuation: CheckedContinuation<Parser.Reply, Error>,
+            parser: Parser
+        ) -> Bool {
+            self.lock.lock()
+            if self.cancelledBeforeReady {
+                self.lock.unlock()
+                continuation.resume(throwing: CancellationError())
+                return false
+            }
+            self.resume = { outcome in
+                switch outcome {
+                case .cancelled:
+                    continuation.resume(throwing: CancellationError())
+                case .reply(let status, let dnsrec):
+                    guard status == ARES_SUCCESS || status == ARES_ENODATA else {
+                        return continuation.resume(throwing: AsyncDNSResolver.Error(cAresCode: CInt(status.rawValue)))
+                    }
+                    do {
+                        let reply = try parser.parse(dnsrec)
+                        continuation.resume(returning: reply)
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+            self.lock.unlock()
+            return true
+        }
+
+        /// Invoked from the c-ares callback (on the poll loop) when the query completes.
         func handle(status: ares_status_t, dnsrec: OpaquePointer?) {
-            self._handler(status, dnsrec)
+            self.lock.lock()
+            let resume = self.resume.take()
+            self.lock.unlock()
+            // Resume outside the lock: never hold `lock` across `continuation.resume`.
+            // A `nil` resume means it has already run: nothing to do.
+            resume?(.reply(status: status, dnsrec: dnsrec))
+        }
+
+        /// Invoked from the task cancellation handler. Resumes this query's continuation
+        /// with `CancellationError` exactly once, without touching c-ares.
+        func cancel() {
+            self.lock.lock()
+            let resume = self.resume.take()
+            if resume == nil {
+                // `initialize` hasn't run yet (it resumes with cancellation when it does),
+                // or the continuation was already resumed (this flag is then never read).
+                self.cancelledBeforeReady = true
+            }
+            self.lock.unlock()
+            resume?(.cancelled)
         }
     }
 }
