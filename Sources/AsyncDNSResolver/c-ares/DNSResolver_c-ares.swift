@@ -202,13 +202,13 @@ final class Ares: Sendable {
                         )
                         // Unlike the deprecated `ares_query`, `ares_query_dnsrec` reports a
                         // synchronous status. On failure the callback will not fire, so free
-                        // the handler here and fail the continuation, otherwise it would leak
-                        // and the caller would await forever.
+                        // the pointer here and fail via `handler`, which resumes once even if
+                        // the task is cancelled concurrently.
                         if status != ARES_SUCCESS {
                             let pointer = handlerPointer.assumingMemoryBound(to: QueryReplyHandler.self)
                             pointer.deinitialize(count: 1)
                             pointer.deallocate()
-                            continuation.resume(throwing: AsyncDNSResolver.Error(cAresCode: CInt(status.rawValue)))
+                            handler.handle(status: status, dnsrec: nil)
                         }
                     }
                 }
