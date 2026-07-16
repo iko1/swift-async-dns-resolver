@@ -10,6 +10,8 @@ var caresExclude = [
     "./c-ares/src/lib/ares_config.h.cmake",
     "./c-ares/src/lib/Makefile.am",
     "./c-ares/src/lib/Makefile.inc",
+    "./c-ares/src/lib/include/README.md",
+    "./c-ares/src/lib/thirdparty/apple/README.md",
 ]
 
 do {
@@ -35,6 +37,7 @@ let package = Package(
             cSettings: [
                 .headerSearchPath("./c-ares/include"),
                 .headerSearchPath("./c-ares/src/lib"),
+                .headerSearchPath("./c-ares/src/lib/include"),
                 .define("HAVE_CONFIG_H", to: "1"),
                 // c-ares is built into the module as a static library, so its
                 // public symbols must not carry __declspec(dllimport/dllexport).
